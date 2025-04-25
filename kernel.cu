@@ -1,6 +1,7 @@
 #include "kernel.h"
+#include <cuda/std/numeric>
 
-__device__ void dot_product_3d(int* x, int* kernel, int x_h, int x_w, int c_in, int out_channel, int k_h, int k_w, int x_row_start, int x_col_start, int *result) {
+__device__ void dot_product_3d(float* x, float* kernel, int x_h, int x_w, int c_in, int out_channel, int k_h, int k_w, int x_row_start, int x_col_start, float* result, float (*act_fn) (float) = nullptr) {
 	int dot_product = 0;
 	for (int in_channel = 0; in_channel < c_in; in_channel++) {
 		for (int k_row = 0, x_row = x_row_start; k_row < k_h; k_row++, x_row++) {
@@ -11,31 +12,104 @@ __device__ void dot_product_3d(int* x, int* kernel, int x_h, int x_w, int c_in, 
 			}
 		}
 	}
-	*result = dot_product;
+	*result = act_fn ? act_fn(dot_product) : dot_product;
 	return;
 }
 
-__global__ void conv2d_gpu (int* x, int* z, int* kernel, int x_h, int x_w, int c_in, int c_out, int k_h, int k_w, int stride) {
+__global__ void conv2d_gpu (float* x, float* z, float* kernel, int x_h, int x_w, int c_in, int c_out, int k_h, int k_w, int stride, float(*act_fn) (float) = nullptr) {
 	int z_h = (x_h - k_h) / stride + 1, z_w = (x_w - k_w) / stride + 1;
 	int z_idx;
 
-	int out_channel = gridDim.x * blockDim.x;
-	int z_row = gridDim.y * blockDim.y;
-	int z_col = gridDim.z * blockDim.z;
+	int out_channel = blockIdx.x * blockDim.x + threadIdx.x;
+	int z_row = blockIdx.y * blockDim.y + threadIdx.y;
+	int z_col = blockIdx.z * blockDim.z + threadIdx.z;
 
 	int x_row_start = z_row * stride, x_col_start = z_col * stride;
 
 	if (out_channel >= c_out || x_h - x_row_start < k_h || x_w - x_col_start < k_w) return;
 
 	z_idx = out_channel * z_h * z_w + z_row * z_w + z_col;
-	dot_product_3d(x, kernel, x_h, x_w, c_in, out_channel, k_h, k_w, x_row_start, x_col_start, z + z_idx);
+	dot_product_3d(x, kernel, x_h, x_w, c_in, out_channel, k_h, k_w, x_row_start, x_col_start, z + z_idx, act_fn);
 }
 
-void do_it(int* x, int* z, int* kernel, int x_h, int x_w, int c_in, int c_out, int k_h, int k_w, int stride) {
-	int z_h = (x_h - k_h) / stride + 1, z_w = (x_w - k_w) / stride + 1;
-	int* d_x, * d_z, * d_kernel;
+__device__ void pool2d_kernel(float* x, int x_h, int x_w, int out_channel, int k_h, int k_w, int x_row_start, int x_col_start, float* result, int type, float(*act_fn) (float) = nullptr) {
+	float pool_value;
+	if (type == 0) pool_value = cuda::std::numeric_limits<float>::min();
+	else if (type == 1) pool_value = 0.f;
 
-	int x_size = c_in * x_h * x_w * sizeof(int), z_size = c_out * z_h * z_w * sizeof(int), kernel_size = c_out * c_in * k_h * k_w * sizeof(int);
+	for (int k_row = 0, x_row = x_row_start; k_row < k_h; k_row++, x_row++) {
+		for (int k_col = 0, x_col = x_col_start; k_col < k_w; k_col++, x_col++) {
+			int x_idx = out_channel * x_h * x_w + x_row * x_w + x_col;
+
+			if (type == 0) pool_value = (x[x_idx] > pool_value) ? x[x_idx] : pool_value;
+			else if (type == 1) pool_value += x[x_idx];
+		}
+	}
+	if (type == 1) pool_value /= k_h * k_w;
+	*result = act_fn ? act_fn(pool_value) : pool_value;
+	return;
+}
+
+__device__ void pooling2d_gpu(float* x, float* z, int x_h, int x_w, int c_in, int k_h, int k_w, int stride_h, int stride_w, int type, float(*act_fn) (float) = nullptr) {
+	int z_h = (x_h - k_h) / stride_h + 1, z_w = (x_w - k_w) / stride_w + 1;
+	int z_idx;
+
+	int out_channel = blockIdx.x * blockDim.x + threadIdx.x;
+	int z_row = blockIdx.y * blockDim.y + threadIdx.y;
+	int z_col = blockIdx.z * blockDim.z + threadIdx.z;
+
+	int x_row_start = z_row * stride_h, x_col_start = z_col * stride_w;
+
+	if (out_channel >= c_in || x_h - x_row_start < k_h || x_w - x_col_start < k_w) return;
+
+	z_idx = out_channel * z_h * z_w + z_row * z_w + z_col;
+	pool2d_kernel(x, x_h, x_w, out_channel, k_h, k_w, x_row_start, x_col_start, z + z_idx, 0, act_fn);
+}
+
+__global__ void maxPooling2d(float* x, float* z, int x_h, int x_w, int c_in, int k_h, int k_w, int stride_h = 1, int stride_w = 1, float(*act_fn) (float) = nullptr) {
+	pooling2d_gpu(x, z, x_h, x_w, c_in, k_h, k_w, stride_h, stride_w, 0, act_fn);
+}
+
+__global__ void avgPooling2d(float* x, float* z, int x_h, int x_w, int c_in, int k_h, int k_w, int stride_h = 1, int stride_w = 1, float(*act_fn) (float) = nullptr) {
+	pooling2d_gpu(x, z, x_h, x_w, c_in, k_h, k_w, stride_h, stride_w, 1, act_fn);
+}
+
+float *conv_layer(float* x, float* kernel, int x_h, int x_w, int c_in, int c_out, int k_h, int k_w, int stride) {
+	int z_h = (x_h - k_h) / stride + 1, z_w = (x_w - k_w) / stride + 1;
+	float* d_x, * d_z, * d_kernel;
+
+	int x_size = c_in * x_h * x_w * sizeof(float), z_size = c_out * z_h * z_w * sizeof(float), kernel_size = c_out * c_in * k_h * k_w * sizeof(float);
+
+	float* z = (float*) malloc(z_size);
+
+	cudaMalloc(&d_x, x_size);
+	cudaMalloc(&d_z, z_size);
+	cudaMalloc(&d_kernel, kernel_size);
+
+	cudaMemcpy(d_x, x, x_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_z, z, z_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_kernel, kernel, kernel_size, cudaMemcpyHostToDevice);
+
+	unsigned int threads_h = 1024 * z_h / (z_h + z_w + c_out), threads_w = 1024 * z_w / (z_h + z_w + c_out);
+	unsigned int threads_c = 1024 - threads_h - threads_w;
+
+	conv2d_gpu<<< {(unsigned int)ceil(c_out / threads_c), (unsigned int)ceil(z_h / threads_h), (unsigned int)ceil(z_w / threads_w)},
+	{ threads_c, threads_h, threads_w } >>>(d_x, d_z, d_kernel, x_h, x_w, c_in, c_out, k_h, k_w, stride);
+
+	cudaMemcpy(z, d_z, z_size, cudaMemcpyDeviceToHost);
+
+	cudaFree(d_x);
+	cudaFree(d_z);
+	cudaFree(d_kernel);
+
+	return z;
+}
+
+void do_it(float* x, float* z, float* kernel, int x_h, int x_w, int c_in, int c_out, int k_h, int k_w, int stride) {
+	int z_h = (x_h - k_h) / stride + 1, z_w = (x_w - k_w) / stride + 1;
+	float* d_x, * d_z, * d_kernel;
+
+	int x_size = c_in * x_h * x_w * sizeof(float), z_size = c_out * z_h * z_w * sizeof(float), kernel_size = c_out * c_in * k_h * k_w * sizeof(float);
 
 	cudaMalloc(&d_x, x_size);
 	cudaMalloc(&d_z, z_size);
@@ -56,5 +130,4 @@ void do_it(int* x, int* z, int* kernel, int x_h, int x_w, int c_in, int c_out, i
 	cudaFree(d_x);
 	cudaFree(d_z);
 	cudaFree(d_kernel);
-
 }
